@@ -1,0 +1,306 @@
+#!/usr/bin/env python
+# Copyright 2018 The Victims Project
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to
+# deal in the Software without restriction, including without limitation the
+# rights to use, copy, modify, merge, publish, distribute, sublicense, and/or
+# sell copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in
+# all copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+# THE SOFTWARE.
+"""
+An example client which follows victims-cve-db:master and imports into a
+sqlite database for simpler searches.
+"""
+
+import os
+
+import git
+import yaml
+
+from sqlalchemy import create_engine
+from sqlalchemy.ext.declarative import declarative_base
+from sqlalchemy import Column, Integer, String, ForeignKey
+from sqlalchemy.orm import relationship, sessionmaker
+
+
+# SQL related stuff. This is where we will be storing the data
+# we pull as we follow the victims-cve-database. It makes it
+# easy to search locally for scanners.
+Base = declarative_base()
+
+
+class Entry(Base):
+    """
+    Representation of an entry.
+    """
+    __tablename__ = 'entries'
+
+    id = Column(Integer, primary_key=True)
+    cve = Column(String)
+    title = Column(String)
+    description = Column(String)
+    cvss_v2 = Column(String)
+    hash = Column(String)
+    references = relationship(
+        'Reference', back_populates='entry',
+        cascade='all, delete, delete-orphan')
+    affected = relationship(
+        'Affected', back_populates='entry',
+        cascade='all, delete, delete-orphan')
+    file_hashes = relationship(
+        'FileHash', back_populates='entry',
+        cascade='all, delete, delete-orphan')
+
+
+class Reference(Base):
+    """
+    Representation of an entry references.
+    """
+    __tablename__ = 'refs'
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    url = Column(String)
+    entry_id = Column(Integer, ForeignKey('entries.id'))
+    entry = relationship('Entry', back_populates='references')
+
+
+class Affected(Base):
+    """
+    Representation of an entry affecteds.
+    """
+    __tablename__ = 'affects'
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    group_id = Column(String)
+    artifact_id = Column(String)
+    version = Column(String)
+    fixed_in = Column(String)
+    unaffected = Column(String)
+    entry_id = Column(Integer, ForeignKey('entries.id'))
+    entry = relationship('Entry', back_populates='affected')
+
+
+class FileHash(Base):
+    """
+    Representation of an entry affecteds.
+    """
+    __tablename__ = 'file_hashes'
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    name = Column(String)
+    hash = Column(String)
+    entry_id = Column(Integer, ForeignKey('entries.id'))
+    entry = relationship('Entry', back_populates='file_hashes')
+
+
+class Client:
+    """
+    Reference client.
+    """
+
+    def __init__(self, args):#base_path, session):
+        """
+        Initialization of the client.
+
+        :param base_path: The parent path the victims-cve-db should be cloned.
+        :type base_path: str
+        """
+
+        engine = create_engine(args.db, echo=False)
+        self.session = sessionmaker(bind=engine)()
+        # Echo all commands if we are in debug
+        if args.debug:
+            engine.echo = True
+
+        # Ensure the database is there and ready for use
+        Base.metadata.create_all(engine)
+
+        # Set up where the content lives
+        self._base_path = args.base_path
+        self.checkout_dir = os.path.sep.join([
+            self._base_path, 'victims-cve-db'])
+        # If it doesn't exist then clone it
+        if not os.path.exists(self.checkout_dir):
+            cmd = git.cmd.Git(self._base_path)
+            cmd.clone('https://github.com/victims/victims-cve-db.git')
+        # And set the repo so we can use it in other methods
+        self.repo = git.Repo(self.checkout_dir)
+
+    def sync(self):
+        """
+        Syncs with the upsteam content and then processes the results.
+        """
+        # If we have a different head since last fetch ...
+        remote_hash = self.repo.remote().fetch()[0].commit.hexsha
+        if remote_hash != self.repo.head.commit.hexsha:
+            # Pull the changes locally and then run processing for every
+            # add, modify and delete
+            for change in self.repo.remote().pull():
+                for file in self._file_changes_by_mode(change, 'A'):
+                    self.add_to_store(self._load_entry(file))
+                for file in self._file_changes_by_mode(change, 'M'):
+                    self.replace_in_store(self._load_entry(file))
+                for file in self._file_changes_by_mode(change, 'D'):
+                    self.delete_from_store(self._load_entry(file))
+        else:
+            sentry = self.session.query(Entry).first()
+            if sentry is None:
+                # We have an empty database, so we must be an initial clone.
+                # Import everything.
+                self.import_full_database()
+            else:
+                print("No change needed")
+
+    def _file_changes_by_mode(self, change, mode):
+        """
+        Finds files which changed between commits for a specific mode.
+
+        :param change: The change that comes back from the pull
+        :type change: git.remote.FetchInfo
+        :param mode: The mode to request from git (man git: --diff-filter)
+        :type mode: str
+        :returns: A list of files for the mode
+        """
+        # Here we diff the previos hash and the current hash. We tell git to
+        # only give us file names and that we are interested in a specific
+        # mode. Lastly split by newline and return.
+        result = self.repo.git.diff('{}~1..{}'.format(
+                 change.commit, change.commit),
+             name_only=True, diff_filter=mode).split('\n')
+        # If we have a single empty item then we don't have any real data
+        if result == ['']:
+            return []
+        return result
+
+    def import_full_database(self):
+        for dirpath, dirs, filenames in os.walk(
+                os.path.sep.join([self.checkout_dir, 'database/java/'])):
+            for filename in filenames:
+                to_import = os.path.sep.join([dirpath, filename])
+                self.add_to_store(self._load_entry(to_import))
+
+    def _load_entry(self, file):
+        """
+        Loads a yaml file into a structure also adding an id based on cve.
+
+        :param file: Path to the tile to load
+        :type file: str
+        """
+        if os.path.isabs(file):
+            file_path = file
+        else:
+            file_path = os.path.sep.join([self.checkout_dir, file])
+        with open(file_path, 'r') as fobj:
+            entry = yaml.safe_load(fobj.read())
+            entry['id'] = int(entry['cve'].replace('-', ''))
+            return entry
+
+    def add_to_store(self, entry):
+        """
+        Adds an entry to the data store
+
+        :param entry: Structure of a specific cve db entry
+        :type entry: dict
+        """
+        new_entry = Entry(
+            id=entry['id'],
+            cve=entry['cve'],
+            title=entry['title'],
+            description=entry.get('description', ''),
+            cvss_v2=entry.get('cvss_v2', ''))
+        self.session.add(new_entry)
+
+        for reference in entry.get('references', []):
+            new_ref = Reference(
+                url=reference,
+                entry_id=new_entry.id
+            )
+            self.session.add(new_ref)
+
+        for affected in entry.get('affected', []):
+            new_affected = Affected(
+                group_id=affected['groupId'],
+                artifact_id=affected['artifactId'],
+                version=','.join(affected.get('version', '')),
+                fixed_in=','.join(affected.get('fixedin', '')),
+                unaffected=','.join(affected.get('unaffected', '')),
+                entry_id=entry['id'])
+            self.session.add(new_affected)
+
+        self.session.commit()
+
+    def delete_from_store(self, entry):
+        """
+        Removes an entry from the data store.
+
+        :param entry: Structure of a specific cve db entry
+        :type entry: dict
+        """
+        to_delete = self.session.query(Entry).filter(
+            Entry.id == entry['id']).first()
+        if to_delete is None:
+            return
+        self.session.delete(to_delete)
+        self.session.commit()
+
+    def replace_in_store(self, entry):
+        """
+        Uses delete and add to replace an entry in the data store.
+
+        :param entry: Structure of a specific cve db entry
+        :type entry: dict
+        """
+        self.delete_from_store(entry)
+        self.add_to_store(entry)
+
+
+def sync_command(args):
+    """
+    Execute the sync subcommand.
+
+    :param args: Parser args
+    :type args: argparse.Namespace
+    """
+    repo = Client(args)
+    repo.sync()
+
+
+def main():
+    import argparse
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument('-d', '--debug', default=False, action='store_true')
+    parser.add_argument('-b', '--base-path', default=os.getcwd())
+    parser.add_argument('--db', default='sqlite:///test.db',
+                        help='Database URI to store data in')
+    parser.set_defaults(func=lambda s: parser.print_help())
+
+    subparsers = parser.add_subparsers(help='sub-command help')
+    sync = subparsers.add_parser('sync', help='Sync from the remote database')
+    sync.set_defaults(func=sync_command)
+
+    args = parser.parse_args()
+
+    try:
+        args.func(args)
+    except git.exc.GitCommandNotFound as e:
+        if args.debug is True:
+            print('raise')
+            raise e
+
+        parser.error('Git error: {}'.format(e))
+
+
+if __name__ == '__main__':
+    main()
