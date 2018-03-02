@@ -96,7 +96,7 @@ class Affected(Base):
 
 class FileHash(Base):
     """
-    Representation of an entry affecteds.
+    Representation of an entries related file hashes.
     """
     __tablename__ = 'file_hashes'
 
@@ -124,14 +124,13 @@ class Client:
     Reference client.
     """
 
-    def __init__(self, args):#base_path, session):
+    def __init__(self, args):
         """
         Initialization of the client.
 
-        :param base_path: The parent path the victims-cve-db should be cloned.
-        :type base_path: str
+        :param args: Namespace returned from an argument parser.
+        :type args: argparse.Namespace
         """
-
         engine = create_engine(args.db, echo=False)
         self.session = sessionmaker(bind=engine)()
         # Echo all commands if we are in debug
@@ -199,6 +198,9 @@ class Client:
         return result
 
     def import_full_database(self):
+        """
+        Imports the entire contents of a checked out database.
+        """
         for dirpath, dirs, filenames in os.walk(
                 os.path.sep.join([self.checkout_dir, 'database/java/'])):
             for filename in filenames:
@@ -211,6 +213,8 @@ class Client:
 
         :param file: Path to the tile to load
         :type file: str
+        :returns: Entry structure
+        :rtype: dict
         """
         if os.path.isabs(file):
             file_path = file
