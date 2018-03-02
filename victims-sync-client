@@ -61,6 +61,9 @@ class Entry(Base):
     file_hashes = relationship(
         'FileHash', back_populates='entry',
         cascade='all, delete, delete-orphan')
+    package_urls = relationship(
+        'PackageURL', back_populates='entry',
+        cascade='all, delete, delete-orphan')
 
 
 class Reference(Base):
@@ -102,6 +105,18 @@ class FileHash(Base):
     hash = Column(String)
     entry_id = Column(Integer, ForeignKey('entries.id'))
     entry = relationship('Entry', back_populates='file_hashes')
+
+
+class PackageURL(Base):
+    """
+    Representation of a url to a package.
+    """
+    __tablename__ = 'package_urls'
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    url = Column(String)
+    entry_id = Column(Integer, ForeignKey('entries.id'))
+    entry = relationship('Entry', back_populates='package_urls')
 
 
 class Client:
@@ -237,6 +252,12 @@ class Client:
                 unaffected=','.join(affected.get('unaffected', '')),
                 entry_id=entry['id'])
             self.session.add(new_affected)
+
+        for purl in entry.get('package_urls', []):
+            new_purl = PackageURL(
+                url=purl,
+                entry_id=entry['id'])
+            self.session.add(new_purl)
 
         self.session.commit()
 
