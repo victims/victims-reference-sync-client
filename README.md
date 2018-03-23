@@ -1,6 +1,6 @@
 # victims-reference-sync-client
 
-Example of a clint which syncs victims-cve-db content into a local database for usage by a scanner.
+Example of a client which syncs victims-cve-db content into a local database for usage by a scanner.
 
 # Install
 Install the requirements:
